@@ -1,11 +1,13 @@
 """
 Steady-state solver for
   0 = (3/2) g + (x - I_{|y|<=z}) * d/dx g + (1/2) y d/dy g + (1/2) d^2/dy^2 g
+  
+Modified to use CENTERED differences in x (instead of upwind)
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.sparse import diags, bmat, eye, vstack
+from scipy.sparse import diags, bmat, eye, vstack, lil_matrix
 from scipy.stats import norm
 import osqp
 
@@ -31,14 +33,17 @@ def z_from_delta(delta):
 # Parameters
 # ==========================================================
 
-Nx = 500
-Ny = 300   
+Nx = 1000
+Ny = 1000   
 
-beta = 12.0
+beta = 20.0
 Y_MAX = 6
 
-delta = 0.5
+delta = 0.2
 z = z_from_delta(delta)
+
+eps_abs=1e-4
+eps_rel=1e-4
 
 print("Parameters:")
 print(f"{Nx=}")
@@ -85,35 +90,57 @@ indicator = ((-z <= Yc) & (Yc <= z)).astype(float)
 plot_dot_grid(x_centers, y_centers, z)
 
 # ==========================================================
-# Build y-operator Ly 
+# Build y-operator Ly with one-sided second-order boundaries
 # ==========================================================
 # Ly discretizes: (1/2)(y * d/dy g + d^2/dy^2 g)
 
 dy = y_centers[1] - y_centers[0]
 
-Ly_lower = np.zeros(Ny)
-Ly_diag  = np.zeros(Ny)
-Ly_upper = np.zeros(Ny)
+print("Building Ly operator with one-sided 2nd-order boundary conditions...")
 
-# Interior: centered differences
+# Use sparse matrix construction with lil format for easier row-wise assembly
+Ly = lil_matrix((Ny, Ny))
+
+# Interior points: centered differences (j = 1, ..., Ny-2)
 for j in range(1, Ny-1):
     yj = Yc[j]
+    # First derivative (centered): (g_{j+1} - g_{j-1})/(2*dy)
+    # Second derivative (centered): (g_{j+1} - 2*g_j + g_{j-1})/dy^2
+    # Combined: (1/2)[y * dg/dy + d^2g/dy^2]
     c_minus = (0.5 - 0.25*dy*yj) / (dy*dy)
     c_plus  = (0.5 + 0.25*dy*yj) / (dy*dy)
     c_diag  = -1.0 / (dy*dy)
     
-    Ly_lower[j] = c_minus
-    Ly_diag[j]  = c_diag
-    Ly_upper[j] = c_plus
+    Ly[j, j-1] = c_minus
+    Ly[j, j]   = c_diag
+    Ly[j, j+1] = c_plus
 
-# note: behavior at boundary -Y_MAX, Y_MAX is left unspecified.
+# Lower boundary (j=0): one-sided forward differences (2nd order)
+# First derivative: (-3*g_0 + 4*g_1 - g_2)/(2*dy)
+# Second derivative: (2*g_0 - 5*g_1 + 4*g_2 - g_3)/dy^2
+j = 0
+yj = Yc[j]
+# Coefficients for (1/2)[y * dg/dy + d^2g/dy^2]
+Ly[j, j]   = 0.5 * (yj * (-3.0)/(2*dy) + 2.0/(dy*dy))
+Ly[j, j+1] = 0.5 * (yj * 4.0/(2*dy) - 5.0/(dy*dy))
+Ly[j, j+2] = 0.5 * (yj * (-1.0)/(2*dy) + 4.0/(dy*dy))
+Ly[j, j+3] = 0.5 * (-1.0/(dy*dy))
 
-Ly = diags(
-    diagonals=[Ly_lower[1:], Ly_diag, Ly_upper[:-1]],
-    offsets=[-1, 0, 1],
-    shape=(Ny, Ny),
-    format="csr"
-)
+# Upper boundary (j=Ny-1): one-sided backward differences (2nd order)
+# First derivative: (3*g_{N-1} - 4*g_{N-2} + g_{N-3})/(2*dy)
+# Second derivative: (2*g_{N-1} - 5*g_{N-2} + 4*g_{N-3} - g_{N-4})/dy^2
+j = Ny - 1
+yj = Yc[j]
+# Coefficients for (1/2)[y * dg/dy + d^2g/dy^2]
+Ly[j, j]   = 0.5 * (yj * 3.0/(2*dy) + 2.0/(dy*dy))
+Ly[j, j-1] = 0.5 * (yj * (-4.0)/(2*dy) - 5.0/(dy*dy))
+Ly[j, j-2] = 0.5 * (yj * 1.0/(2*dy) + 4.0/(dy*dy))
+Ly[j, j-3] = 0.5 * (-1.0/(dy*dy))
+
+# Convert to CSR format for efficient operations
+Ly = Ly.tocsr()
+
+print(f"  Ly matrix: shape={Ly.shape}, nnz={Ly.nnz}")
 
 # ==========================================================
 # Build y-local block By 
@@ -122,33 +149,58 @@ Iy = diags(I_int, 0, shape=(Ny, Ny))
 By = 1.5 * Iy + Ly 
 
 # ==========================================================
-# Build block operator A
+# Build block operator A with centered differences in x
 # ==========================================================
+print("Building operator A with centered differences in x...")
+
 blocks_main = []
 blocks_low  = []
 blocks_up   = []
 
 for i in range(Nx):
     xi = x_centers[i]
-    a = xi - indicator
-    a_pos = np.maximum(a, 0.0)
-    a_neg = np.minimum(a, 0.0)
-
-    diag_contrib = diags(a_pos / dx_back[i] - a_neg / dx_forw[i], 0)
-    B_i = (By + diag_contrib).tocsr()
-    blocks_main.append(B_i)
-
-    if i > 0:
-        L_i = diags(-a_pos / dx_back[i], 0).tocsr()
-    else:
+    a = xi - indicator  # velocity coefficient at each y
+    
+    # Use centered differences: a * dg/dx ≈ a * (g_{i+1} - g_{i-1})/(dx_back + dx_forward)
+    # Exception: boundaries use one-sided differences
+    
+    if i == 0:
+        # Forward difference at left boundary: a * (g_1 - g_0)/dx_forward
+        diag_contrib = diags(-a / dx_forw[i], 0)
+        B_i = (By + diag_contrib).tocsr()
+        blocks_main.append(B_i)
+        
         L_i = diags(np.zeros(Ny), 0).tocsr()
-    blocks_low.append(L_i)
-
-    if i < Nx - 1:
-        U_i = diags(a_neg / dx_forw[i], 0).tocsr()
-    else:
+        blocks_low.append(L_i)
+        
+        U_i = diags(a / dx_forw[i], 0).tocsr()
+        blocks_up.append(U_i)
+        
+    elif i == Nx - 1:
+        # Backward difference at right boundary: a * (g_{N-1} - g_{N-2})/dx_back
+        diag_contrib = diags(a / dx_back[i], 0)
+        B_i = (By + diag_contrib).tocsr()
+        blocks_main.append(B_i)
+        
+        L_i = diags(-a / dx_back[i], 0).tocsr()
+        blocks_low.append(L_i)
+        
         U_i = diags(np.zeros(Ny), 0).tocsr()
-    blocks_up.append(U_i)
+        blocks_up.append(U_i)
+        
+    else:
+        # Interior: centered difference a * (g_{i+1} - g_{i-1})/(dx_back + dx_forward)
+        dx_cent = dx_back[i] + dx_forw[i]
+        
+        # No diagonal contribution for centered difference
+        B_i = By.copy()
+        blocks_main.append(B_i)
+        
+        L_i = diags(-a / dx_cent, 0).tocsr()
+        blocks_low.append(L_i)
+        
+        U_i = diags(a / dx_cent, 0).tocsr()
+        blocks_up.append(U_i)
 
 A_blocks = []
 for i in range(Nx):
@@ -209,7 +261,7 @@ print("\nSetting up and solving QP with OSQP...")
 prob = osqp.OSQP()
 prob.setup(P=P, q=q, A=A_qp, l=l, u=u,
            verbose=True, 
-           eps_abs=1e-4, eps_rel=1e-4, 
+           eps_abs=eps_abs, eps_rel=eps_rel, 
            max_iter=1_000_000)
 
 res = prob.solve()
@@ -217,6 +269,9 @@ if res.info.status_val not in (1, 2):
     raise RuntimeError(f"OSQP did not find a valid solution. Status: {res.info.status}")
 
 g = res.x
+if np.any(g < 0):
+    print(f"g contains negative entries: {np.min(g)=}")
+    print(g)
 g = np.maximum(g, 0.0)
 mass = c @ g
 if mass <= 0:
@@ -259,7 +314,7 @@ ax.axhline(z, ls='--', c='k', alpha=0.5)
 ax.axhline(-z, ls='--', c='k', alpha=0.5)
 ax.set_xlabel('x')
 ax.set_ylabel('y')
-ax.set_title('Solution g(x,y)')
+ax.set_title('Solution g(x,y) - CENTERED in x')
 plt.colorbar(cf, ax=ax)
 
 ax = axes[0, 1]
@@ -294,8 +349,8 @@ ax.legend()
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('pde_solution_corrected.png', dpi=150, bbox_inches='tight')
-print("Saved: pde_solution_corrected.png")
+plt.savefig('pde_solution_centered.png', dpi=150, bbox_inches='tight')
+print("Saved: pde_solution_centered.png")
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -317,8 +372,8 @@ ax.set_title('Histogram of residuals')
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('pde_residual_corrected.png', dpi=150, bbox_inches='tight')
-print("Saved: pde_residual_corrected.png")
+plt.savefig('pde_residual_centered.png', dpi=150, bbox_inches='tight')
+print("Saved: pde_residual_centered.png")
 
 # Profile plots
 fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -354,8 +409,8 @@ for idx, x_val in enumerate(x_profile_values):
     ax.set_xlim([Yc[0], Yc[-1]])
 
 plt.tight_layout()
-plt.savefig('pde_profiles_corrected.png', dpi=150, bbox_inches='tight')
-print("Saved: pde_profiles_corrected.png")
+plt.savefig('pde_profiles_centered.png', dpi=150, bbox_inches='tight')
+print("Saved: pde_profiles_centered.png")
 plt.show()
 
 print("\n==== PROFILE VALUES AT y≈0 ====")
@@ -370,12 +425,10 @@ for x_val in x_profile_values:
           f"N(0,1) at 0={normal_at_zero:.6f}, ratio={ratio:.4f}")
 print("================================\n")
 
-
-
 k1 = 100
 k2 = 50
 
-fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=False)
 gx = np.sum(G * wy_int[np.newaxis, :], axis=1)
 axes[0].scatter(x_centers[:k1], gx[:k1], lw=2, s=1)
 axes[0].set_xlabel('x')

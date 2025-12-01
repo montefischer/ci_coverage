@@ -150,6 +150,23 @@ def get_conditional_y_density(x_target, pi, j_0):
     total_mass = np.sum(masses)
     return y_vals, (masses / total_mass) / gamma, effective_x
 
+def get_x_density(j_0, state_list, pi):
+    eta = 1 / j_0
+    xs = np.array([j * eta for (j, k) in state_list])
+
+    x_vals = np.unique(xs)
+    x_marg = np.zeros_like(x_vals)
+    for val, prob in zip(xs, pi):
+        x_marg[np.where(x_vals == val)[0][0]] += prob
+    
+    return x_vals, x_marg
+
+def get_stats(support, density):
+    mean = np.sum(support * density)
+    cumsum = np.cumsum(density)
+    median = support[np.searchsorted(cumsum, 0.5)]
+ 
+    return mean, median
 
 if __name__ == "__main__":
     j_0 = 100

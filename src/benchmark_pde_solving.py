@@ -2,6 +2,15 @@ import time
 import os
 from pde_markov_discretization import *
 
+import os
+MAX_THREADS = 8
+
+os.environ["OMP_NUM_THREADS"] = f"{MAX_THREADS}"
+os.environ["OPENBLAS_NUM_THREADS"] = f"{MAX_THREADS}"
+os.environ["MKL_NUM_THREADS"] = f"{MAX_THREADS}"
+os.environ["VECLIB_MAXIMUM_THREADS"] = f"{MAX_THREADS}"
+os.environ["NUMEXPR_NUM_THREADS"] = f"{MAX_THREADS}"
+
 if __name__ == '__main__':
     os.makedirs('density', exist_ok=True)
     xres_array = [100, 1000, 2500, 5000, 10000]

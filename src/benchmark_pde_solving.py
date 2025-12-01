@@ -14,7 +14,7 @@ from pde_markov_discretization import *
 
 if __name__ == '__main__':
     os.makedirs('density', exist_ok=True)
-    xres_array = [100, 1000, 2500, 5000, 10000]
+    xres_array = [100, 200, 300, 400, 500, 1000, 2500, 5000, 10000]
     for j_0 in xres_array:
         delta = 0.5
         z = z_from_delta(delta)

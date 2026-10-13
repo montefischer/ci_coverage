@@ -2,8 +2,8 @@ import time
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.sparse import csr_matrix
-from scipy.sparse.linalg import eigs
+from scipy.sparse import csr_matrix, identity
+from scipy.sparse.linalg import splu
 from scipy.stats import norm
 
 
@@ -117,11 +117,17 @@ def build_transition_matrix(j_0, z, verbose=True):
 
 
 def stationary_distribution(P, tol=1e-12, max_iter=150_000, verbose=True):
-    # compute stationary distribution of P by Arnoldi iteration
+    # compute stationary distribution of P by sparse LU solve with v[s0] = 1 pinned (tol, max_iter unused)
     tstart = time.perf_counter()
-    vals, vecs = eigs(P.T, k=1, which='LM', tol=tol, maxiter=max_iter)
-    v = vecs[:, 0].real
-    v = np.abs(v)
+    n = P.shape[0]
+    A = (P.T - identity(n, format='csr')).tocsc()
+    s0 = n // 2
+    keep = np.ones(n, bool)
+    keep[s0] = False
+    lu = splu(A[keep][:, keep].tocsc(), permc_spec='MMD_AT_PLUS_A')
+    v = np.empty(n)
+    v[keep] = lu.solve(-A[keep][:, [s0]].toarray().ravel())
+    v[s0] = 1.0
     v = v / np.sum(v)
     if verbose:
         print(f"Stationary distribution found in {time.perf_counter() - tstart:.2f}s")
